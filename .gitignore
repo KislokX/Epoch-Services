@@ -1,0 +1,9 @@
+/target
+gen/schemas/
+
+# **The local override that makes the two-surfaces rule survive.** Cargo.toml reaches the five
+# shared crates by revision so a stranger can build this; a developer with an Epoch checkout
+# beside it puts a `paths` override here and builds against their local crates instead. The path
+# is theirs, not this repository's, so it is never committed -- and a committed one would break
+# every clone that does not happen to have Epoch in the same place.
+/.cargo/config.toml

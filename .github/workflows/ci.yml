@@ -1,0 +1,102 @@
+# The gates EpochServices has to pass, on every platform it claims to run on.
+#
+# ## Why this file exists at all
+#
+# Until 2026-09-08 this program was a directory inside Epoch's repository and Epoch's CI checked
+# it. It is its own repository now, and the two-surfaces rule did not move with it: the five
+# crates below are shared, and a change to one of them reaches this program only when somebody
+# bumps the revision in `Cargo.toml`. **This workflow is the other half of that** — the place a
+# shared crate that only compiles on one side is found.
+#
+# ## Three operating systems, because this program's whole purpose is somebody else's machine
+#
+# A suite that has only ever run on one operating system has only ever measured one. That was
+# written down after a Mac build found three defects nothing on Windows could have — an attribute
+# that had drifted onto the wrong item, a listener bound on the wrong thread, and a keychain that
+# answers differently when nobody is signed in at the machine. This program is the one people run
+# on the *other* computer, so all three are gates rather than a nice-to-have.
+#
+# ## Callable, because the release workflow must not own a second copy of these steps
+#
+# `epochservices.yml` calls this whole file with `uses:`. A second list of gates is a list that
+# drifts, and the one that drifts is the one nobody runs.
+
+name: CI
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      # One platform failing must not hide what the other two would have said.
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-22.04]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The webview is part of the system on Windows and macOS and is not part of the Linux
+      # image. It is needed to *compile*, not only to bundle, because this program links Tauri.
+      - name: Linux webview dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      # **The toolchain the manifest asks for, not whatever is newest.** `rust-version` is 1.90
+      # because the shared crates need it; a gate running something else is measuring a build
+      # nobody performs.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-services-${{ hashFiles('Cargo.lock') }}
+
+      # **`--locked`.** Without it a gate may resolve a different dependency tree from the one in
+      # the lock file, and then pass about a build nobody will ever perform.
+      - name: It compiles
+        run: cargo check --all-targets --locked
+
+      - name: Formatting
+        run: cargo fmt --check
+
+      - name: Lints
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+  # Advisories and licences, once rather than three times: the answer is about the dependency
+  # tree, which is the same on every platform this checks. `deny.toml` here has its own target
+  # list — this program runs on three operating systems and Epoch runs on one.
+  supply-chain:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+
+      - name: Advisories and licences
+        run: |
+          cargo install cargo-deny --locked
+          cargo deny check
