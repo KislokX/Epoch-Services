@@ -128,6 +128,21 @@ jobs:
         working-directory: target/release/bundle
         run: |
           set -euo pipefail
+
+          # **Three runners, and not one hashing command all three have.** `shasum` is a Perl
+          # script: macOS ships it, Ubuntu ships `sha256sum` instead, and the Windows runner's
+          # Git Bash has `sha256sum` and no Perl at all. Measured — `shasum: command not found`,
+          # exit 127 — after a local simulation of this exact step passed, because the Git Bash
+          # on the machine it was written on happens to have both.
+          #
+          # Whatever a harness supplies for itself is the part it is not measuring, and this is
+          # the third shape of that in this project: tools, timing, and now the command itself.
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest() { sha256sum "$@"; }
+          else
+            digest() { shasum -a 256 "$@"; }
+          fi
+
           find . -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
             -o -name '*.AppImage' -o -name '*.rpm' \) | sort > /tmp/bundles
           if [ "$(wc -l < /tmp/bundles)" -ne "$(xargs -n1 basename < /tmp/bundles | sort -u | wc -l)" ]; then
@@ -136,7 +151,7 @@ jobs:
           fi
           : > SHA256SUMS
           while read -r f; do
-            ( cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")" )
+            ( cd "$(dirname "$f")" && digest "$(basename "$f")" )
           done < /tmp/bundles >> SHA256SUMS
           cat SHA256SUMS
 
