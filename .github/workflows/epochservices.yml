@@ -113,18 +113,31 @@ jobs:
       # A checksum for every bundle, and printed into the log as well: a list that travels with
       # the file it describes proves only that they arrived together.
       #
-      # **These names are paths, and that is correct only while they stay in the artefact.**
-      # The artefact keeps the directory tree, so `shasum -c` resolves `./nsis/x.exe` inside it.
-      # A Release page is flat — `gh release create` uploads every asset under its basename —
-      # so the day a publish job is added, this has to write basenames or the file that exists
-      # to prove a download is intact will answer `FAILED open or read`. Epoch's own v0.1.0
-      # draft did exactly that, and it was found by downloading it rather than by reading it.
+      # **The names written here are the names the person checking will have.** These bundles are
+      # produced in separate directories — `nsis/`, `msi/`, `dmg/`, `deb/` — and a Release page is
+      # flat: `gh release create` uploads every asset under its basename. Writing the paths
+      # `shasum` walked would publish a file that answers `FAILED open or read` for everything.
+      #
+      # Not hypothetical. Epoch's own v0.1.0 draft shipped exactly that, and it was found by
+      # downloading it rather than by reading it — the bytes were correct and the instrument that
+      # proves they are correct was the broken part, failing in the direction that reads as
+      # tampering. Two bundles sharing a basename stop the build rather than publishing two lines
+      # nobody can tell apart.
       - name: What this job produced
         shell: bash
         working-directory: target/release/bundle
         run: |
-          find . -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb'             -o -name '*.AppImage' -o -name '*.rpm' \) -print0 |
-            xargs -0 -r shasum -a 256 | tee SHA256SUMS
+          set -euo pipefail
+          find . -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
+            -o -name '*.AppImage' -o -name '*.rpm' \) | sort > /tmp/bundles
+          if [ "$(wc -l < /tmp/bundles)" -ne "$(xargs -n1 basename < /tmp/bundles | sort -u | wc -l)" ]; then
+            echo "two bundles share a basename; the Release page cannot hold both" >&2
+            exit 1
+          fi
+          : > SHA256SUMS
+          while read -r f; do
+            ( cd "$(dirname "$f")" && shasum -a 256 "$(basename "$f")" )
+          done < /tmp/bundles >> SHA256SUMS
           cat SHA256SUMS
 
       # **What is inside it**, which neither the checksum nor the provenance says. 294 Rust
@@ -132,6 +145,12 @@ jobs:
       # between a `grep` and reconstructing the dependency tree of a version already downloaded.
       #
       # No `npm sbom` on this side: this program has no frontend of its own.
+      #
+      # **One per platform, named after it.** The three builds do not have the same dependency
+      # tree — Windows pulls crates macOS never sees — so a single list would be true about one
+      # machine and quietly wrong about the other two. And three files called
+      # `epochservices.cargo.cdx.json` cannot sit on one flat Release page anyway: the second
+      # would overwrite the first, which is the same collision the checksums are guarded against.
       - name: Install the parts-list tool
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
 
@@ -141,8 +160,9 @@ jobs:
           set -euo pipefail
           cargo cyclonedx --format json --spec-version 1.5
           mkdir -p target/release/bundle
-          mv epoch-services.cdx.json target/release/bundle/epochservices.cargo.cdx.json
-          f=target/release/bundle/epochservices.cargo.cdx.json
+          mv epoch-services.cdx.json \
+            "target/release/bundle/epochservices.${{ matrix.name }}.cargo.cdx.json"
+          f="target/release/bundle/epochservices.${{ matrix.name }}.cargo.cdx.json"
           grep -q '"bomFormat"' "$f" || { echo "not a CycloneDX document"; exit 1; }
           echo "$f  $(grep -o '"bom-ref"' "$f" | wc -l) entries"
 
@@ -173,3 +193,140 @@ jobs:
           path: |
             target/release/bundle/**/*
           if-no-files-found: error
+  # **Somewhere a person can actually download from.**
+  #
+  # Everything above builds three platforms and signs a statement about what it built, and all of
+  # it was landing on a workflow run: an artefact expires, and reaching one takes a signed-in
+  # browser. A release that a stranger cannot download is a release that did not happen.
+  #
+  # **A separate job, for the reason the one above has `contents: read`.** A job that builds must
+  # not be able to write to the repository, and a job that publishes has no business compiling
+  # anything. This one downloads what was already built and attested and does nothing else — so
+  # what it publishes is the artefact the attestation is about, rather than a second build of the
+  # same source that would hash differently.
+  #
+  # **A draft.** The owner reads it and presses the button; nothing here publishes on its own.
+  publish:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/services-v')
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      # No `name:`, so all three platforms' artefacts arrive, each in its own directory.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: release
+
+      - name: One page, three platforms
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          find release -type f | sort
+
+          # **One list per platform, and that was measured rather than preferred.** Three files
+          # called SHA256SUMS cannot sit on a flat page, so the obvious fix was to concatenate
+          # them into one. Run against a real download it answers:
+          #
+          #   EpochServices_0.1.0_aarch64.dmg: FAILED open or read
+          #   WARNING: 3 listed files could not be read              exit 1
+          #
+          # — for an intact file, because nobody downloads three platforms. Three FAILED lines
+          # and a non-zero exit is the instrument reading as tampering, which is the defect this
+          # release chain has already shipped once. `--ignore-missing` answers it and needs the
+          # reader to know a flag; a file per platform removes the failure altogether.
+          #
+          # The artefact directories are named `epochservices-<platform>`, so the name comes from
+          # what produced it rather than from a list written here.
+          for d in release/epochservices-*/; do
+            platform="$(basename "$d" | sed 's|^epochservices-||')"
+            cp "$d/SHA256SUMS" "SHA256SUMS-$platform"
+            echo "--- $platform"
+            cat "SHA256SUMS-$platform"
+          done
+
+          # Everything a person downloads, flattened. A basename collision would already have
+          # stopped the build that produced it.
+          find release -type f \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' -o -name '*.deb' \
+            -o -name '*.AppImage' -o -name '*.rpm' -o -name '*.cdx.json' \) | sort > /tmp/assets
+          if [ "$(wc -l < /tmp/assets)" -ne "$(xargs -n1 basename < /tmp/assets | sort -u | wc -l)" ]; then
+            echo "two artefacts share a basename across platforms" >&2
+            exit 1
+          fi
+
+          cat > notes.md <<'NOTES'
+          **Lend another computer's models to your crew.**
+
+          EpochServices runs on a machine that has a graphics card — a desktop, a Mac in another
+          room — and makes its models available to [Epoch](https://github.com/KislokX/Epoch), so a
+          character on your laptop can think on that machine's card.
+
+          It is small and single-purpose. It holds no crew, no Quests, no Chronicles and no
+          knowledge: it lends compute, and it says exactly what it is lending.
+
+          ## What it does
+
+          | | |
+          |---|---|
+          | **Lends runtimes** | Ollama, llama.cpp and LM Studio, whichever are installed |
+          | **Weighs a model** | real byte counts against this card's memory, measured here rather than guessed by the Host |
+          | **Finds and pulls models** | Hugging Face and Ollama, onto the disk where they will actually run |
+          | **Lends a studio** | ComfyUI on this machine, so a picture is drawn on the card that can draw it |
+
+          **Pairing is a code, typed once.** Press `SHOW A CODE` here, type it into Epoch under
+          `MACHINES` with this machine's address. The code is spent the moment it works. No
+          account, no cloud, no sign-in.
+
+          **Every runtime stays on `127.0.0.1`.** Ollama, llama.cpp and LM Studio are never exposed
+          to your network. The only thing listening is this program, and it answers nobody without
+          the secret your Host gave it.
+
+          Grants are separate questions with separate answers: *may think for me* and *may drive my
+          World from there*.
+
+          ## Which file
+
+          | | |
+          |---|---|
+          | Windows | `*-setup.exe` (per user) or `*.msi` |
+          | macOS | `*.dmg` |
+          | Linux | `*.deb` or `*.AppImage` |
+
+          ## Checking what you have
+
+          It is **unsigned**, and that is a decision rather than an omission: a certificate is a
+          recurring cost and it buys *who made this*, which is the half a stranger can least act
+          on. The half you can check is free and ships with every release.
+
+          There is one list per platform — take the one matching what you downloaded, so the
+          check is about your file and not about the two you did not take.
+
+          ```
+          sha256sum -c SHA256SUMS-windows       # or -macos, or -linux
+          shasum -a 256 -c SHA256SUMS-macos     # macOS spells it this way
+          gh attestation verify <the file you downloaded> --repo OWNER_REPO
+          ```
+
+          The first says the file you have is the file this job produced. The second says it came
+          from this commit of this repository, built on GitHub's own runners and signed through a
+          public transparency log.
+
+          **Neither stops the operating system's warning.** Windows shows *"Windows protected your
+          PC"* — *More info*, then *Run anyway*. macOS refuses an unnotarised app: **System
+          Settings → Privacy & Security**, then **Open Anyway**. Notarisation needs a paid Apple
+          account, and saying otherwise would be a claim this project does not make.
+
+          The `.cdx.json` files are CycloneDX parts lists, one per platform, because the three
+          builds do not have the same dependency tree.
+          NOTES
+          sed -i "s|OWNER_REPO|${GITHUB_REPOSITORY}|" notes.md
+
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft \
+            --title "${GITHUB_REF_NAME}" \
+            --notes-file notes.md \
+            SHA256SUMS-* $(cat /tmp/assets)
